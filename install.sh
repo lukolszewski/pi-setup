@@ -20,6 +20,7 @@ PKGS=(
 )
 
 DRY=0 FORCE=0 CHECK_ONLY=0 WITH_TRUST=0
+DEFAULT_MODEL=""
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PAYLOAD="$REPO_ROOT/payload/.pi/agent"
 PI_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
@@ -34,11 +35,12 @@ while (( $# )); do
     --force)        FORCE=1 ;;
     --check)        CHECK_ONLY=1 ;;
     --with-trust)   WITH_TRUST=1 ;;
+    --default-model) DEFAULT_MODEL="${2:?--default-model needs provider/model}"; shift ;;
     --pi-version)   PI_VERSION="${2:?--pi-version needs a value}"; shift ;;
     --pi-dir)       PI_DIR="${2:?--pi-dir needs a value}"; shift ;;
     -h|--help)
       sed -n '2,12p' "${BASH_SOURCE[0]}"
-      printf '\nusage: install.sh [--dry-run] [--force] [--check] [--with-trust] [--pi-version V] [--pi-dir DIR]\n'
+      printf '\nusage: install.sh [--dry-run] [--force] [--check] [--with-trust] [--default-model provider/model] [--pi-version V] [--pi-dir DIR]\n'
       exit 0 ;;
     *) die "unknown argument: $1 (try --help)" ;;
   esac
@@ -97,13 +99,51 @@ copy_payload() {
   log "copying payload"
   local src rel dest
   while IFS= read -r src; do
-    rel="${src#$PAYLOAD/}"
+    rel="${src#"$PAYLOAD"/}"
     case "$rel" in
       trust.json)
         if (( ! WITH_TRUST )); then log "  skipped    trust.json (per-machine trust; use --with-trust)"; continue; fi ;;
+      settings.json)
+        merge_settings "$src"; continue ;;
     esac
     copy_one "$src" "$PI_DIR/$rel"
   done < <(find "$PAYLOAD" -type f | sort)
+}
+
+# settings.json is shared with pi itself (defaults, changelog marker, project overrides), so never treat a
+# difference as a conflict: only the keys this repo owns are compared and, with --force, merged in.
+merge_settings() {
+  local repo="$1" live="$PI_DIR/settings.json"
+  if [ ! -f "$live" ]; then
+    run install -D -m 644 "$repo" "$live"
+    return
+  fi
+  REPO="$repo" LIVE="$live" FORCE="$FORCE" DRY="$DRY" node -e '
+    const fs = require("fs");
+    const OWNED = ["packages", "extensions", "skills", "prompts", "themes", "compaction", "retry",
+                   "hideThinkingBlock", "tuiMode", "theme"];
+    const repo = JSON.parse(fs.readFileSync(process.env.REPO, "utf8"));
+    const live = JSON.parse(fs.readFileSync(process.env.LIVE, "utf8"));
+    const ownedDrift = OWNED.filter((k) => JSON.stringify(repo[k]) !== JSON.stringify(live[k]));
+    const localEdits = Object.keys(live).filter((k) => !OWNED.includes(k) && JSON.stringify(repo[k]) !== JSON.stringify(live[k]));
+    if (ownedDrift.length === 0) {
+      console.log("  ok       settings.json (pi-managed keys left alone"
+        + (localEdits.length ? ": " + localEdits.join(", ") : "") + ")");
+      process.exit(0);
+    }
+    if (process.env.FORCE === "1") {
+      for (const k of ownedDrift) if (k in repo) live[k] = repo[k]; else delete live[k];
+      if (process.env.DRY === "1") { console.log("DRY: merge " + ownedDrift.join(", ") + " into settings.json"); process.exit(0); }
+      fs.writeFileSync(process.env.LIVE + ".tmp", JSON.stringify(live, null, 2) + "\n");
+      fs.renameSync(process.env.LIVE + ".tmp", process.env.LIVE);
+      console.log("  merged   settings.json repo keys: " + ownedDrift.join(", ") + " (others preserved)");
+      process.exit(0);
+    }
+    if (process.env.DRY === "1") { console.log("DRY: settings.json repo keys differ: " + ownedDrift.join(", ")); process.exit(0); }
+    fs.copyFileSync(process.env.REPO, process.env.LIVE + ".from-repo");
+    console.log("  KEPT     settings.json (repo keys differ: " + ownedDrift.join(", ")
+      + ") -> repo copy at settings.json.from-repo; --force merges those keys");
+  '
 }
 
 install_packages() {
@@ -115,29 +155,73 @@ install_packages() {
   done
 }
 
+# pi defaults to provider "google" when settings.json names no default, which fails on a fresh box with a
+# bare "Connection error". --default-model writes the two keys that /model itself would write.
+apply_default_model() {
+  if [ -z "$DEFAULT_MODEL" ]; then
+    log "no --default-model given; pi keeps its built-in default until you pick one in /model"
+    return
+  fi
+  case "$DEFAULT_MODEL" in
+    */*) : ;;
+    *) die "--default-model wants provider/model, got: $DEFAULT_MODEL" ;;
+  esac
+  local settings="$PI_DIR/settings.json"
+  [ -f "$settings" ] || die "no settings.json at $settings (run without --dry-run first)"
+  log "setting default model: $DEFAULT_MODEL"
+  if (( DRY )); then printf 'DRY: write defaultProvider/defaultModel into %s\n' "$settings"; return; fi
+  DEFAULT_MODEL="$DEFAULT_MODEL" SETTINGS="$settings" node -e '
+    const fs = require("fs");
+    const [prov, ...rest] = process.env.DEFAULT_MODEL.split("/");
+    const path = process.env.SETTINGS;
+    const cfg = JSON.parse(fs.readFileSync(path, "utf8"));
+    cfg.defaultProvider = prov;
+    cfg.defaultModel = rest.join("/");
+    fs.writeFileSync(path + ".tmp", JSON.stringify(cfg, null, 2) + "\n");
+    fs.renameSync(path + ".tmp", path);
+  '
+}
+
+# pi-web-access does NOT fall back when a provider key is rejected: web_search just fails. So probe the key
+# once before writing a config that routes through it (the probe costs one of the 2,500 free credits).
+serper_key_ok() {
+  if (( DRY )); then printf 'DRY: probe SERPER_API_KEY against google.serper.dev\n'; return 0; fi
+  SERPER_API_KEY="${SERPER_API_KEY:-}" node -e '
+    fetch("https://google.serper.dev/search", {
+      method: "POST",
+      headers: { "X-API-KEY": process.env.SERPER_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ q: "ping", num: 1 }),
+      signal: AbortSignal.timeout(10000),
+    }).then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(2));
+  ' 2>/dev/null
+}
+
 write_search_config() {
   # pi-web-access needs no config to work (zero-config Exa). Serper (google.com SERP) is opt-in via env.
   local dest="$PI_DIR/web-search.json"
   if [ -e "$dest" ]; then log "web-search.json already present, leaving it alone"; return; fi
-  if [ -n "${SERPER_API_KEY:-}" ]; then
-    log "SERPER_API_KEY is set -> writing web-search.json (serper first, exa fallback)"
-    if (( DRY )); then
-      printf 'DRY: write %s\n' "$dest"
-    else
-      cat >"$dest" <<'JSON'
+  if [ -z "${SERPER_API_KEY:-}" ]; then
+    log "SERPER_API_KEY unset -> no web-search.json; pi-web-access uses zero-config search (no Google results)"
+    return
+  fi
+  if ! serper_key_ok; then
+    printf 'warning: serper.dev rejected SERPER_API_KEY, so web-search.json was NOT written.\n'
+    printf '         Routing through a rejected key makes web_search fail outright, so zero-config\n'
+    printf '         search is kept. Check the key, then re-run ./install.sh.\n'
+    return
+  fi
+  log "SERPER_API_KEY accepted -> writing web-search.json (serper first, exa on transient errors)"
+  if (( DRY )); then printf 'DRY: write %s\n' "$dest"; return; fi
+  cat >"$dest" <<'JSON'
 {
   "serperApiKey": "$SERPER_API_KEY",
   "searchRouting": {
     "providers": ["serper", "exa"],
-    "fallbackOn": ["transient", "quota", "network", "invalid-response"]
+    "fallbackOn": ["unsupported", "transient", "quota", "network", "invalid-response"]
   }
 }
 JSON
-      chmod 600 "$dest"
-    fi
-  else
-    log "SERPER_API_KEY unset -> no web-search.json; pi-web-access uses zero-config search (no Google results)"
-  fi
+  chmod 600 "$dest"
 }
 
 verify() {
@@ -182,6 +266,7 @@ main() {
   fi
   install_pi
   copy_payload
+  apply_default_model
   install_packages
   write_search_config
   if (( DRY )); then
@@ -192,7 +277,7 @@ main() {
   log ""
   log "done. Next steps on this machine:"
   log "  1. pi                # then /login for your provider (and GitHub Copilot if you use it)"
-  log "  2. /model            # pick a default; pi records it in settings.json itself"
+  log "  2. /model            # pick a default, or pass --default-model provider/model next run"
   log "  3. optional: export SERPER_API_KEY=... for Google results, then re-run ./install.sh"
   log "  note: rg and fd are downloaded by pi itself on first grep/find use"
 }
