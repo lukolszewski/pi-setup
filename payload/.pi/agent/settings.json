@@ -1,0 +1,21 @@
+{
+  "packages": [
+    "npm:@ayulab/pi-rewind@0.4.6",
+    "git:github.com/lukolszewski/pi-stall-recovery@38112576e9595dc7e7ae9c0e93b605078771f966",
+    "npm:pi-schedule-prompt@0.4.1",
+    "npm:pi-web-access@0.42.0"
+  ],
+  "extensions": [
+    "-extensions/approval-gate.ts"
+  ],
+  "hideThinkingBlock": false,
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 24576
+  },
+  "retry": {
+    "enabled": true
+  },
+  "tuiMode": "regular",
+  "theme": "dark"
+}

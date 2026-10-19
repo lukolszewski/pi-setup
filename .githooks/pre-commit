@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Reject commits that would leak provider credentials or machine-local identity into a public repo.
+set -euo pipefail
+root="$(git rev-parse --show-toplevel)"
+pattern='kam\.lan|/home/[a-z0-9_-]{2,}|sk-[A-Za-z0-9]{20,}|gh[op]_[A-Za-z0-9]{20,}|BSA_[A-Za-z0-9]{10,}|xai-[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{30,}|"apiKey"[[:space:]]*:[[:space:]]*"[^$!"{][^"]*"'
+staged=$(git diff --cached --name-only --diff-filter=ACM | grep -v -E '(^|/)(pre-commit|sync\.sh)$' || true)
+[ -z "$staged" ] && exit 0
+if hits=$(printf '%s\n' "$staged" | xargs -r grep -nHE "$pattern" 2>/dev/null); then
+  printf 'pre-commit: refusing commit, possible secrets/personal paths:\n%s\n' "$hits" >&2
+  printf 'Fix the content (not the pattern). Override with: git commit --no-verify\n' >&2
+  exit 1
+fi
+exit 0

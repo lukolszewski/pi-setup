@@ -1,0 +1,9 @@
+# never stage machine-local or secret material
+models.json
+auth.json
+*.env
+secrets/
+*.bak-*
+*.from-repo
+node_modules/
+.DS_Store
